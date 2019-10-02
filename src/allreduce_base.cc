@@ -459,11 +459,7 @@ AllreduceBase::TryAllreduce(void *sendrecvbuf_,
                             size_t type_nbytes,
                             size_t count,
                             ReduceFunction reducer) {
-  if (count > reduce_ring_mincount) {
-    return this->TryAllreduceRing(sendrecvbuf_, type_nbytes, count, reducer);
-  } else {
-    return this->TryAllreduceTree(sendrecvbuf_, type_nbytes, count, reducer);
-  }
+  return this->TryAllreduceTree(sendrecvbuf_, type_nbytes, count, reducer);
 }
 /*!
  * \brief perform in-place allreduce, on sendrecvbuf,
