@@ -27,13 +27,23 @@
 #include <vector>
 #include <unordered_map>
 #include "utils.h"
+#include <iostream>
+
 
 // mbedtls declarations
+#if !defined(MBEDTLS_CONFIG_FILE)
+#include "../../../../mbedtls/include/mbedtls/config.h"
+#else
+#include MBEDTLS_CONFIG_FILE
+#endif
 #include "../../../../mbedtls/include/mbedtls/net.h"
 #include "../../../../mbedtls/include/mbedtls/ssl.h"
 #include "../../../../mbedtls/include/mbedtls/entropy.h"
 #include "../../../../mbedtls/include/mbedtls/ctr_drbg.h"
+#include "../../../../mbedtls/include/mbedtls/platform.h"
 #include "../../../../mbedtls/include/mbedtls/debug.h"
+// enable debug (make sure MBEDTLS_DEBUG_C is defined as well)
+#define DEBUG_LEVEL 4
 
 #if defined(_WIN32) || defined(__MINGW32__)
 typedef int ssize_t;
@@ -50,6 +60,19 @@ typedef int SOCKET;
 typedef size_t sock_size_t;
 const int INVALID_SOCKET = -1;
 #endif  // defined(_WIN32)
+
+static void my_debug(void *ctx, int level, const char *file, int line, const char *str) {
+  const char *p, *basename;
+  (void) ctx;
+
+  /* Extract basename from file */
+  for (p = basename = file; *p != '\0'; p++) {
+    if (*p == '/' || *p == '\\') {
+      basename = p + 1;
+    }
+  }
+  mbedtls_printf("%s:%04d: |%d| %s", basename, line, level, str);
+}
 
 namespace rabit {
 namespace utils {
@@ -108,11 +131,20 @@ struct SockAddr {
  */
 class Socket {
  public:
-  /*! \brief the file descriptor of socket */
+  /*! \brief the TLS wrapper of a socket */
   mbedtls_net_context server_fd;
-  // default conversion to int
+  mbedtls_ctr_drbg_context ctr_drbg;
+  mbedtls_ssl_context ssl;
+  mbedtls_ssl_config conf;
+  mbedtls_x509_crt cacert;
+  mbedtls_entropy_context entropy;
+  // default conversion to mbedtls context
   inline operator mbedtls_net_context() const {
     return server_fd;
+  }
+  // default conversion to int
+  inline operator SOCKET() const {
+    return server_fd.fd;
   }
   /*!
    * \return last error of socket operation
@@ -169,17 +201,10 @@ class Socket {
       Socket::Error("SetNonBlock");
     }
 #else
-    int flag = fcntl(server_fd, F_GETFL, 0);
-    if (flag == -1) {
-      Socket::Error("SetNonBlock-1");
-    }
-    if (non_block) {
-      flag |= O_NONBLOCK;
+    if (!non_block) {
+      mbedtls_net_set_block(&server_fd);
     } else {
-      flag &= ~O_NONBLOCK;
-    }
-    if (fcntl(server_fd, F_SETFL, flag) == -1) {
-      Socket::Error("SetNonBlock-2");
+      mbedtls_net_set_nonblock(&server_fd);
     }
 #endif  // _WIN32
   }
@@ -193,8 +218,7 @@ class Socket {
     // TODO(tqchen) add prefix check
     for (int port = start_port; port < end_port; ++port) {
       SockAddr addr("0.0.0.0", port);
-      if (bind(server_fd, reinterpret_cast<sockaddr*>(&addr.addr),
-               sizeof(addr.addr)) == 0) {
+      if (mbedtls_net_bind(&server_fd, "0.0.0.0", std::to_string(addr.port()).c_str(), MBEDTLS_NET_PROTO_TCP) == 0) {
         return port;
       }
 #if defined(_WIN32)
@@ -214,7 +238,7 @@ class Socket {
   inline int GetSockError(void) const {
     int error = 0;
     socklen_t len = sizeof(error);
-    if (getsockopt(server_fd,  SOL_SOCKET, SO_ERROR,
+    if (getsockopt(server_fd.fd,  SOL_SOCKET, SO_ERROR,
             reinterpret_cast<char*>(&error), &len) != 0) {
       Error("GetSockError");
     }
@@ -224,8 +248,7 @@ class Socket {
   inline bool BadSocket(void) const {
     if (IsClosed()) return true;
     int err = GetSockError();
-    if (err == EBADF || err == EINTR) return true;
-    return false;
+    return err == EBADF || err == EINTR;
   }
   /*! \brief check if socket is already closed */
   inline bool IsClosed(void) const {
@@ -237,7 +260,11 @@ class Socket {
 #ifdef _WIN32
       closesocket(server_fd);
 #else
-      close(server_fd);
+      mbedtls_net_free(&server_fd);
+      mbedtls_ssl_free(&ssl);
+      mbedtls_ssl_config_free(&conf);
+      mbedtls_ctr_drbg_free(&ctr_drbg);
+      mbedtls_entropy_free(&entropy);
 #endif
       server_fd.fd = INVALID_SOCKET;
     } else {
@@ -256,7 +283,6 @@ class Socket {
 
  protected:
   explicit Socket(SOCKET sockfd) {
-    mbedtls_net_init(&server_fd);
   }
 };
 
@@ -265,31 +291,14 @@ class Socket {
  */
 class TCPSocket : public Socket{
 
-  mbedtls_entropy_context entropy;
-  mbedtls_ctr_drbg_context ctr_drbg;
-  mbedtls_ssl_context ssl;
-  mbedtls_ssl_config conf;
-  mbedtls_x509_crt cacert;
   int ret;
+
  public:
   // constructor (initializes server_fd to be -1 (INVALID_SOCKET)
   TCPSocket(void) : Socket(INVALID_SOCKET) {
   }
   // initializes server_fd to be whatever is passed in (not invalid)
   explicit TCPSocket(SOCKET sockfd) : Socket(sockfd) {
-
-    // initialize all mbedTLS contexts
-    mbedtls_net_init(&server_fd);
-    mbedtls_ssl_init(&ssl);
-    mbedtls_ssl_config_init(&conf);
-    mbedtls_x509_crt_init(&cacert);
-    mbedtls_ctr_drbg_init(&ctr_drbg);
-
-    // seeds and sets up entropy source
-    mbedtls_entropy_init( &entropy );
-    if ((ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, NULL, 0)) != 0) {
-      Socket::Error("Failed! CTR_DRBG entropy source could not be seeded");
-    }
   }
   /*!
    * \brief enable/disable TCP keepalive
@@ -297,7 +306,7 @@ class TCPSocket : public Socket{
    */
   void SetKeepAlive(bool keepalive) {
     int opt = static_cast<int>(keepalive);
-    if (setsockopt(server_fd, SOL_SOCKET, SO_KEEPALIVE,
+    if (setsockopt(server_fd.fd, SOL_SOCKET, SO_KEEPALIVE,
                    reinterpret_cast<char*>(&opt), sizeof(opt)) < 0) {
       Socket::Error("SetKeepAlive");
     }
@@ -306,7 +315,7 @@ class TCPSocket : public Socket{
     struct linger sl;
     sl.l_onoff = 1;    /* non-zero value enables linger option in kernel */
     sl.l_linger = timeout;    /* timeout interval in seconds */
-    if (setsockopt(server_fd, SOL_SOCKET, SO_LINGER, reinterpret_cast<char*>(&sl), sizeof(sl)) == -1) {
+    if (setsockopt(server_fd.fd, SOL_SOCKET, SO_LINGER, reinterpret_cast<char*>(&sl), sizeof(sl)) == -1) {
       Socket::Error("SO_LINGER");
     }
   }
@@ -315,21 +324,35 @@ class TCPSocket : public Socket{
    * \param af domain
    */
   inline void Create(int af = PF_INET) {
-    server_fd = socket(PF_INET, SOCK_STREAM, 0);
-    if (server_fd.fd == INVALID_SOCKET) {
-      Socket::Error("Create");
+    // initialize all mbedTLS contexts
+    mbedtls_net_init(&server_fd);
+    mbedtls_ssl_init(&ssl);
+    mbedtls_ssl_config_init(&conf);
+    mbedtls_x509_crt_init(&cacert);
+    mbedtls_ctr_drbg_init(&ctr_drbg);
+
+    // seeds and sets up entropy source
+    mbedtls_entropy_init(&entropy);
+    if ((ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, NULL, 0)) != 0) {
+      Socket::Error("Error: CTR_DRBG entropy source could not be seeded");
     }
+    //enable debugging
+#if defined(MBEDTLS_DEBUG_C)
+    mbedtls_ssl_conf_dbg(&conf, my_debug, NULL);
+    mbedtls_debug_set_threshold(DEBUG_LEVEL);
+#endif
   }
   /*!
    * \brief perform listen of the socket
    * \param backlog backlog parameter
    */
   inline void Listen(int backlog = 16) {
-    listen(server_fd, backlog);
+    //TODO: start off here
+    listen(server_fd.fd, backlog);
   }
   /*! \brief get a new connection */
   TCPSocket Accept(void) {
-    SOCKET newfd = accept(server_fd, NULL, NULL);
+    SOCKET newfd = accept(server_fd.fd, NULL, NULL);
     if (newfd == INVALID_SOCKET) {
       Socket::Error("Accept");
     }
@@ -345,7 +368,7 @@ class TCPSocket : public Socket{
     if (ioctlsocket(server_fd, SIOCATMARK, &atmark) != NO_ERROR) return -1;
 #else
     int atmark;
-    if (ioctl(server_fd, SIOCATMARK, &atmark) == -1) return -1;
+    if (ioctl(server_fd.fd, SIOCATMARK, &atmark) == -1) return -1;
 #endif  // _WIN32
     return static_cast<int>(atmark);
   }
@@ -355,8 +378,29 @@ class TCPSocket : public Socket{
    * \return whether connect is successful
    */
   inline bool Connect(const SockAddr &addr) {
-    // TODO: leave off from here
-    return mbedtls_net_connect(&server_fd, addr.GetHostName(), addr.port(), MBEDTLS_NET_PROTO_TCP) == 0;
+    // Connect
+    if ((ret = mbedtls_net_connect(&server_fd, addr.AddrStr().c_str(),
+        std::to_string(addr.port()).c_str(), MBEDTLS_NET_PROTO_TCP)) != 0) {
+      Socket::Error("Error: Could not connect");
+    }
+    // configure TLS layer
+    if ((ret = mbedtls_ssl_config_defaults(&conf,
+        MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
+      Socket::Error("Error: Could not configure TLS layer");
+    }
+    // set no authentication (DO NOT DO THIS FOR COMPLETE VERSION)
+    mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
+    // Configure random engine & engable debugging
+    mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
+
+    //Set up SSL context
+    if ((ret = mbedtls_ssl_set_hostname( &ssl, "TLS Server")) != 0) {
+      Socket::Error("Error: Could not set up SSL context");
+    }
+    // Configure input/output functions for sending data
+    mbedtls_ssl_set_bio(&ssl, &server_fd, mbedtls_net_send, mbedtls_net_recv, NULL);
+
+
   }
   /*!
    * \brief send data using the socket
@@ -367,8 +411,12 @@ class TCPSocket : public Socket{
    *         return -1 if error occurs
    */
   inline ssize_t Send(const void *buf_, size_t len, int flag = 0) {
-    const char *buf = reinterpret_cast<const char*>(buf_);
-    return send(server_fd, buf, static_cast<sock_size_t>(len), flag);
+    const unsigned char *buf = reinterpret_cast<const unsigned char*>(buf_);
+    ret = mbedtls_ssl_write(&ssl, buf, len);
+    if (ret < 0) {
+      Socket::Error("Error: Sending");
+    }
+    return ret;
   }
   /*!
    * \brief receive data using the socket
@@ -379,8 +427,12 @@ class TCPSocket : public Socket{
    *         return -1 if error occurs
    */
   inline ssize_t Recv(void *buf_, size_t len, int flags = 0) {
-    char *buf = reinterpret_cast<char*>(buf_);
-    return recv(server_fd, buf, static_cast<sock_size_t>(len), flags);
+    unsigned char *buf = reinterpret_cast<unsigned char*>(buf_);
+    ret = mbedtls_ssl_read(&ssl, buf, len);
+    if (ret < 0) {
+      Socket::Error("Error: Receiving");
+    }
+    return ret;
   }
   /*!
    * \brief peform block write that will attempt to send all data out
@@ -390,11 +442,11 @@ class TCPSocket : public Socket{
    * \return size of data actually sent
    */
   inline size_t SendAll(const void *buf_, size_t len) {
-    const char *buf = reinterpret_cast<const char*>(buf_);
+    const unsigned char *buf = reinterpret_cast<const unsigned char*>(buf_);
     size_t ndone = 0;
     while (ndone <  len) {
-      ssize_t ret = send(server_fd, buf, static_cast<ssize_t>(len - ndone), 0);
-      if (ret == -1) {
+      ret = mbedtls_ssl_write(&ssl, buf, len);
+      if (ret < 0) {
         if (LastErrorWouldBlock()) return ndone;
         Socket::Error("SendAll");
       }
@@ -411,12 +463,11 @@ class TCPSocket : public Socket{
    * \return size of data actually sent
    */
   inline size_t RecvAll(void *buf_, size_t len) {
-    char *buf = reinterpret_cast<char*>(buf_);
+    unsigned char *buf = reinterpret_cast<unsigned char*>(buf_);
     size_t ndone = 0;
     while (ndone <  len) {
-      ssize_t ret = recv(server_fd, buf,
-                         static_cast<sock_size_t>(len - ndone), MSG_WAITALL);
-      if (ret == -1) {
+      ret = mbedtls_ssl_read(&ssl, buf, len);
+      if (ret < 0) {
         if (LastErrorWouldBlock()) return ndone;
         Socket::Error("RecvAll");
       }
