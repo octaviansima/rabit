@@ -28,6 +28,13 @@
 #include <unordered_map>
 #include "utils.h"
 
+// mbedtls declarations
+#include "../../../../mbedtls/include/mbedtls/net.h"
+#include "../../../../mbedtls/include/mbedtls/ssl.h"
+#include "../../../../mbedtls/include/mbedtls/entropy.h"
+#include "../../../../mbedtls/include/mbedtls/ctr_drbg.h"
+#include "../../../../mbedtls/include/mbedtls/debug.h"
+
 #if defined(_WIN32) || defined(__MINGW32__)
 typedef int ssize_t;
 #endif  // defined(_WIN32) || defined(__MINGW32__)
@@ -102,10 +109,10 @@ struct SockAddr {
 class Socket {
  public:
   /*! \brief the file descriptor of socket */
-  SOCKET sockfd;
+  mbedtls_net_context server_fd;
   // default conversion to int
-  inline operator SOCKET() const {
-    return sockfd;
+  inline operator mbedtls_net_context() const {
+    return server_fd;
   }
   /*!
    * \return last error of socket operation
@@ -158,11 +165,11 @@ class Socket {
   inline void SetNonBlock(bool non_block) {
 #ifdef _WIN32
     u_long mode = non_block ? 1 : 0;
-    if (ioctlsocket(sockfd, FIONBIO, &mode) != NO_ERROR) {
+    if (ioctlsocket(server_fd, FIONBIO, &mode) != NO_ERROR) {
       Socket::Error("SetNonBlock");
     }
 #else
-    int flag = fcntl(sockfd, F_GETFL, 0);
+    int flag = fcntl(server_fd, F_GETFL, 0);
     if (flag == -1) {
       Socket::Error("SetNonBlock-1");
     }
@@ -171,20 +178,10 @@ class Socket {
     } else {
       flag &= ~O_NONBLOCK;
     }
-    if (fcntl(sockfd, F_SETFL, flag) == -1) {
+    if (fcntl(server_fd, F_SETFL, flag) == -1) {
       Socket::Error("SetNonBlock-2");
     }
 #endif  // _WIN32
-  }
-  /*!
-   * \brief bind the socket to an address
-   * \param addr
-   */
-  inline void Bind(const SockAddr &addr) {
-    if (bind(sockfd, reinterpret_cast<const sockaddr*>(&addr.addr),
-             sizeof(addr.addr)) == -1) {
-      Socket::Error("Bind");
-    }
   }
   /*!
    * \brief try bind the socket to host, from start_port to end_port
@@ -196,7 +193,7 @@ class Socket {
     // TODO(tqchen) add prefix check
     for (int port = start_port; port < end_port; ++port) {
       SockAddr addr("0.0.0.0", port);
-      if (bind(sockfd, reinterpret_cast<sockaddr*>(&addr.addr),
+      if (bind(server_fd, reinterpret_cast<sockaddr*>(&addr.addr),
                sizeof(addr.addr)) == 0) {
         return port;
       }
@@ -217,7 +214,7 @@ class Socket {
   inline int GetSockError(void) const {
     int error = 0;
     socklen_t len = sizeof(error);
-    if (getsockopt(sockfd,  SOL_SOCKET, SO_ERROR,
+    if (getsockopt(server_fd,  SOL_SOCKET, SO_ERROR,
             reinterpret_cast<char*>(&error), &len) != 0) {
       Error("GetSockError");
     }
@@ -232,17 +229,17 @@ class Socket {
   }
   /*! \brief check if socket is already closed */
   inline bool IsClosed(void) const {
-    return sockfd == INVALID_SOCKET;
+    return server_fd.fd == INVALID_SOCKET;
   }
   /*! \brief close the socket */
   inline void Close(void) {
-    if (sockfd != INVALID_SOCKET) {
+    if (server_fd.fd != INVALID_SOCKET) {
 #ifdef _WIN32
-      closesocket(sockfd);
+      closesocket(server_fd);
 #else
-      close(sockfd);
+      close(server_fd);
 #endif
-      sockfd = INVALID_SOCKET;
+      server_fd.fd = INVALID_SOCKET;
     } else {
       Error("Socket::Close double close the socket or close without create");
     }
@@ -258,7 +255,8 @@ class Socket {
   }
 
  protected:
-  explicit Socket(SOCKET sockfd) : sockfd(sockfd) {
+  explicit Socket(SOCKET sockfd) {
+    mbedtls_net_init(&server_fd);
   }
 };
 
@@ -266,11 +264,32 @@ class Socket {
  * \brief a wrapper of TCP socket that hopefully be cross platform
  */
 class TCPSocket : public Socket{
+
+  mbedtls_entropy_context entropy;
+  mbedtls_ctr_drbg_context ctr_drbg;
+  mbedtls_ssl_context ssl;
+  mbedtls_ssl_config conf;
+  mbedtls_x509_crt cacert;
+  int ret;
  public:
-  // constructor
+  // constructor (initializes server_fd to be -1 (INVALID_SOCKET)
   TCPSocket(void) : Socket(INVALID_SOCKET) {
   }
+  // initializes server_fd to be whatever is passed in (not invalid)
   explicit TCPSocket(SOCKET sockfd) : Socket(sockfd) {
+
+    // initialize all mbedTLS contexts
+    mbedtls_net_init(&server_fd);
+    mbedtls_ssl_init(&ssl);
+    mbedtls_ssl_config_init(&conf);
+    mbedtls_x509_crt_init(&cacert);
+    mbedtls_ctr_drbg_init(&ctr_drbg);
+
+    // seeds and sets up entropy source
+    mbedtls_entropy_init( &entropy );
+    if ((ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, NULL, 0)) != 0) {
+      Socket::Error("Failed! CTR_DRBG entropy source could not be seeded");
+    }
   }
   /*!
    * \brief enable/disable TCP keepalive
@@ -278,7 +297,7 @@ class TCPSocket : public Socket{
    */
   void SetKeepAlive(bool keepalive) {
     int opt = static_cast<int>(keepalive);
-    if (setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE,
+    if (setsockopt(server_fd, SOL_SOCKET, SO_KEEPALIVE,
                    reinterpret_cast<char*>(&opt), sizeof(opt)) < 0) {
       Socket::Error("SetKeepAlive");
     }
@@ -287,7 +306,7 @@ class TCPSocket : public Socket{
     struct linger sl;
     sl.l_onoff = 1;    /* non-zero value enables linger option in kernel */
     sl.l_linger = timeout;    /* timeout interval in seconds */
-    if (setsockopt(sockfd, SOL_SOCKET, SO_LINGER, reinterpret_cast<char*>(&sl), sizeof(sl)) == -1) {
+    if (setsockopt(server_fd, SOL_SOCKET, SO_LINGER, reinterpret_cast<char*>(&sl), sizeof(sl)) == -1) {
       Socket::Error("SO_LINGER");
     }
   }
@@ -296,8 +315,8 @@ class TCPSocket : public Socket{
    * \param af domain
    */
   inline void Create(int af = PF_INET) {
-    sockfd = socket(PF_INET, SOCK_STREAM, 0);
-    if (sockfd == INVALID_SOCKET) {
+    server_fd = socket(PF_INET, SOCK_STREAM, 0);
+    if (server_fd.fd == INVALID_SOCKET) {
       Socket::Error("Create");
     }
   }
@@ -306,11 +325,11 @@ class TCPSocket : public Socket{
    * \param backlog backlog parameter
    */
   inline void Listen(int backlog = 16) {
-    listen(sockfd, backlog);
+    listen(server_fd, backlog);
   }
   /*! \brief get a new connection */
   TCPSocket Accept(void) {
-    SOCKET newfd = accept(sockfd, NULL, NULL);
+    SOCKET newfd = accept(server_fd, NULL, NULL);
     if (newfd == INVALID_SOCKET) {
       Socket::Error("Accept");
     }
@@ -323,10 +342,10 @@ class TCPSocket : public Socket{
   inline int AtMark(void) const {
 #ifdef _WIN32
     unsigned long atmark;  // NOLINT(*)
-    if (ioctlsocket(sockfd, SIOCATMARK, &atmark) != NO_ERROR) return -1;
+    if (ioctlsocket(server_fd, SIOCATMARK, &atmark) != NO_ERROR) return -1;
 #else
     int atmark;
-    if (ioctl(sockfd, SIOCATMARK, &atmark) == -1) return -1;
+    if (ioctl(server_fd, SIOCATMARK, &atmark) == -1) return -1;
 #endif  // _WIN32
     return static_cast<int>(atmark);
   }
@@ -336,8 +355,8 @@ class TCPSocket : public Socket{
    * \return whether connect is successful
    */
   inline bool Connect(const SockAddr &addr) {
-    return connect(sockfd, reinterpret_cast<const sockaddr*>(&addr.addr),
-                   sizeof(addr.addr)) == 0;
+    // TODO: leave off from here
+    return mbedtls_net_connect(&server_fd, addr.GetHostName(), addr.port(), MBEDTLS_NET_PROTO_TCP) == 0;
   }
   /*!
    * \brief send data using the socket
@@ -349,7 +368,7 @@ class TCPSocket : public Socket{
    */
   inline ssize_t Send(const void *buf_, size_t len, int flag = 0) {
     const char *buf = reinterpret_cast<const char*>(buf_);
-    return send(sockfd, buf, static_cast<sock_size_t>(len), flag);
+    return send(server_fd, buf, static_cast<sock_size_t>(len), flag);
   }
   /*!
    * \brief receive data using the socket
@@ -361,7 +380,7 @@ class TCPSocket : public Socket{
    */
   inline ssize_t Recv(void *buf_, size_t len, int flags = 0) {
     char *buf = reinterpret_cast<char*>(buf_);
-    return recv(sockfd, buf, static_cast<sock_size_t>(len), flags);
+    return recv(server_fd, buf, static_cast<sock_size_t>(len), flags);
   }
   /*!
    * \brief peform block write that will attempt to send all data out
@@ -374,7 +393,7 @@ class TCPSocket : public Socket{
     const char *buf = reinterpret_cast<const char*>(buf_);
     size_t ndone = 0;
     while (ndone <  len) {
-      ssize_t ret = send(sockfd, buf, static_cast<ssize_t>(len - ndone), 0);
+      ssize_t ret = send(server_fd, buf, static_cast<ssize_t>(len - ndone), 0);
       if (ret == -1) {
         if (LastErrorWouldBlock()) return ndone;
         Socket::Error("SendAll");
@@ -395,7 +414,7 @@ class TCPSocket : public Socket{
     char *buf = reinterpret_cast<char*>(buf_);
     size_t ndone = 0;
     while (ndone <  len) {
-      ssize_t ret = recv(sockfd, buf,
+      ssize_t ret = recv(server_fd, buf,
                          static_cast<sock_size_t>(len - ndone), MSG_WAITALL);
       if (ret == -1) {
         if (LastErrorWouldBlock()) return ndone;

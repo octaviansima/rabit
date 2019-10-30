@@ -41,7 +41,12 @@ else
     DMLC=../dmlc-core
 endif
 
-CFLAGS += -I $(DMLC)/include -I include/
+# mbedtls support
+MBED=../mbedtls
+
+CFLAGS += -I $(DMLC)/include -I $(MBED)/include -I include/ -L../mbedtls/library -lmbedcrypto -lmbedtls -lmbedx509
+# mbedtls support
+CFLAGS += -L../mbedtls/library -lmbedcrypto -lmbedtls -lmbedx509
 
 # build path
 BPATH=.
@@ -53,7 +58,7 @@ SLIB= lib/librabit.so lib/librabit_mock.so lib/librabit_base.so
 ALIB= lib/librabit.a lib/librabit_empty.a lib/librabit_mock.a lib/librabit_base.a
 MPISLIB= lib/librabit_mpi.so
 MPIALIB= lib/librabit_mpi.a
-HEADERS=src/*.h include/rabit/*.h include/rabit/internal/*.h
+HEADERS=src/*.h include/rabit/*.h include/rabit/internal/*.h 
 
 .PHONY: clean all install mpi python lint doc doxygen
 
