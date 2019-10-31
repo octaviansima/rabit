@@ -72,7 +72,6 @@ static void print_err(int ret) {
 }
 /**
  * Debug callback for mbed TLS
- * Just prints on the USB serial port
  */
 static void my_debug(void *ctx, int level, const char *file, int line, const char *str) {
   const char *p, *basename;
@@ -231,8 +230,7 @@ class Socket {
   inline int TryBindHost(int start_port, int end_port) {
     // TODO(tqchen) add prefix check
     for (int port = start_port; port < end_port; ++port) {
-      SockAddr addr("0.0.0.0", port);
-      if (mbedtls_net_bind(&server_fd, "0.0.0.0", std::to_string(addr.port()).c_str(), MBEDTLS_NET_PROTO_TCP) == 0) {
+      if (mbedtls_net_bind(&server_fd, "0.0.0.0", std::to_string(port).c_str(), MBEDTLS_NET_PROTO_TCP) == 0) {
         return port;
       }
 #if defined(_WIN32)
@@ -345,21 +343,12 @@ class TCPSocket : public Socket{
     mbedtls_x509_crt_init(&cacert);
     mbedtls_ctr_drbg_init(&ctr_drbg);
 
-    //enable debugging
-#if defined(MBEDTLS_DEBUG_C) && DEBUG_LEVEL > 0
-    mbedtls_ssl_conf_dbg(&conf, my_debug, NULL);
-    mbedtls_debug_set_threshold(DEBUG_LEVEL);
-#endif
-
     // seeds and sets up entropy source
     mbedtls_entropy_init(&entropy);
     if ((ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, NULL, 0)) != 0) {
+      print_err(ret);
       Socket::Error("Error: CTR_DRBG entropy source could not be seeded");
     }
-    // set no authentication (DO NOT DO THIS FOR COMPLETE VERSION)
-    mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
-    // Configure random engine
-    mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
   }
   /*!
    * \brief perform listen of the socket
@@ -400,20 +389,51 @@ class TCPSocket : public Socket{
     // Connect
     if ((ret = mbedtls_net_connect(&server_fd, addr.AddrStr().c_str(),
         std::to_string(addr.port()).c_str(), MBEDTLS_NET_PROTO_TCP)) != 0) {
+      print_err(ret);
       Socket::Error("Error: Could not connect");
     }
     // configure TLS layer
     if ((ret = mbedtls_ssl_config_defaults(&conf,
-        MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
+        MBEDTLS_SSL_IS_SERVER, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
+      print_err(ret);
       Socket::Error("Error: Could not configure TLS layer");
     }
 
-    //Set up SSL context
-    if ((ret = mbedtls_ssl_set_hostname( &ssl, "TLS Server")) != 0) {
-      Socket::Error("Error: Could not set up SSL context");
+    // no certificate auth required (CHANGE FOR COMPLETE VERSION)
+    mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_OPTIONAL);
+    mbedtls_ssl_conf_ca_chain(&conf, &cacert, NULL);
+
+    // configure RNG
+    mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
+
+    // enable debugging
+#if defined(MBEDTLS_DEBUG_C) && DEBUG_LEVEL > 0
+    mbedtls_ssl_conf_dbg(&conf, my_debug, stdout);
+    mbedtls_debug_set_threshold(DEBUG_LEVEL);
+#endif
+
+    // set up SSL context
+    if ((ret = mbedtls_ssl_setup(&ssl, &conf)) != 0) {
+      print_err(ret);
+      Socket::Error("Error: could not set up SSL");
     }
-    // Configure input/output functions for sending data
+
+    // configure hostname
+    if ((ret = mbedtls_ssl_set_hostname(&ssl, "Tracker")) != 0) {
+      print_err(ret);
+      Socket::Error("Error: Could not set hostname");
+    }
+    // configure input/output functions for sending data
     mbedtls_ssl_set_bio(&ssl, &server_fd, mbedtls_net_send, mbedtls_net_recv, NULL);
+
+    // perform handshake
+    while ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
+      mbedtls_printf("%d\n", ret);
+      if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+        print_err(ret);
+        Socket::Error("Error: Failed handshake");
+      }
+    }
     return true;
   }
   /*!
@@ -428,6 +448,7 @@ class TCPSocket : public Socket{
     const unsigned char *buf = reinterpret_cast<const unsigned char*>(buf_);
     ret = mbedtls_ssl_write(&ssl, buf, len);
     if (ret < 0) {
+      print_err(ret);
       Socket::Error("Error: Sending");
     }
     return ret;
@@ -444,6 +465,7 @@ class TCPSocket : public Socket{
     unsigned char *buf = reinterpret_cast<unsigned char*>(buf_);
     ret = mbedtls_ssl_read(&ssl, buf, len);
     if (ret < 0) {
+      print_err(ret);
       Socket::Error("Error: Receiving");
     }
     return ret;
@@ -459,12 +481,13 @@ class TCPSocket : public Socket{
     // TODO: Erroring here
     const unsigned char *buf = reinterpret_cast<const unsigned char*>(buf_);
     size_t ndone = 0;
-    while (ndone <  len) {
-      ret = mbedtls_ssl_write(&ssl, buf, len);
-      if (ret < 0) {
-        print_err(ret);
-        if (LastErrorWouldBlock()) return ndone;
-        Socket::Error("SendAll");
+    while (ndone < len) {
+      while ((ret = mbedtls_ssl_write( &ssl, buf, len)) <= 0) {
+        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+          if (LastErrorWouldBlock()) return ndone;
+          print_err(ret);
+          Socket::Error("Error: SendAll");
+        }
       }
       buf += ret;
       ndone += ret;
@@ -485,7 +508,8 @@ class TCPSocket : public Socket{
       ret = mbedtls_ssl_read(&ssl, buf, len);
       if (ret < 0) {
         if (LastErrorWouldBlock()) return ndone;
-        Socket::Error("RecvAll");
+        print_err(ret);
+        Socket::Error("Error: RecvAll");
       }
       if (ret == 0) return ndone;
       buf += ret;
