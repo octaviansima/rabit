@@ -29,8 +29,7 @@
 #include "utils.h"
 #include <iostream>
 
-
-// mbedtls declarations
+// mbedtls settings
 #if !defined(MBEDTLS_CONFIG_FILE)
 #include "../../../../mbedtls/include/mbedtls/config.h"
 #else
@@ -41,9 +40,12 @@
 #include "../../../../mbedtls/include/mbedtls/entropy.h"
 #include "../../../../mbedtls/include/mbedtls/ctr_drbg.h"
 #include "../../../../mbedtls/include/mbedtls/platform.h"
-#include "../../../../mbedtls/include/mbedtls/debug.h"
-// enable debug (make sure MBEDTLS_DEBUG_C is defined as well)
+#include "../../../../mbedtls/include/mbedtls/error.h"
+
 #define DEBUG_LEVEL 4
+#if defined(MBEDTLS_DEBUG_C) && DEBUG_LEVEL > 0
+#include "../../../../mbedtls/include/mbedtls/debug.h"
+#endif
 
 #if defined(_WIN32) || defined(__MINGW32__)
 typedef int ssize_t;
@@ -61,18 +63,30 @@ typedef size_t sock_size_t;
 const int INVALID_SOCKET = -1;
 #endif  // defined(_WIN32)
 
+#if defined(MBEDTLS_DEBUG_C) && DEBUG_LEVEL > 0
+static void print_err(int ret) {
+  const size_t LEN = 2048;
+  char err_buf[LEN];
+  mbedtls_strerror(ret, err_buf, LEN);
+  mbedtls_printf(" ERROR: %s\n", err_buf);
+}
+/**
+ * Debug callback for mbed TLS
+ * Just prints on the USB serial port
+ */
 static void my_debug(void *ctx, int level, const char *file, int line, const char *str) {
   const char *p, *basename;
   (void) ctx;
 
   /* Extract basename from file */
-  for (p = basename = file; *p != '\0'; p++) {
-    if (*p == '/' || *p == '\\') {
+  for(p = basename = file; *p != '\0'; p++) {
+    if(*p == '/' || *p == '\\') {
       basename = p + 1;
     }
   }
   mbedtls_printf("%s:%04d: |%d| %s", basename, line, level, str);
 }
+#endif
 
 namespace rabit {
 namespace utils {
@@ -331,23 +345,28 @@ class TCPSocket : public Socket{
     mbedtls_x509_crt_init(&cacert);
     mbedtls_ctr_drbg_init(&ctr_drbg);
 
+    //enable debugging
+#if defined(MBEDTLS_DEBUG_C) && DEBUG_LEVEL > 0
+    mbedtls_ssl_conf_dbg(&conf, my_debug, NULL);
+    mbedtls_debug_set_threshold(DEBUG_LEVEL);
+#endif
+
     // seeds and sets up entropy source
     mbedtls_entropy_init(&entropy);
     if ((ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, NULL, 0)) != 0) {
       Socket::Error("Error: CTR_DRBG entropy source could not be seeded");
     }
-    //enable debugging
-#if defined(MBEDTLS_DEBUG_C)
-    mbedtls_ssl_conf_dbg(&conf, my_debug, NULL);
-    mbedtls_debug_set_threshold(DEBUG_LEVEL);
-#endif
+    // set no authentication (DO NOT DO THIS FOR COMPLETE VERSION)
+    mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
+    // Configure random engine
+    mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
   }
   /*!
    * \brief perform listen of the socket
    * \param backlog backlog parameter
    */
   inline void Listen(int backlog = 16) {
-    //TODO: start off here
+    //TODO: start off here if needed?
     listen(server_fd.fd, backlog);
   }
   /*! \brief get a new connection */
@@ -388,10 +407,6 @@ class TCPSocket : public Socket{
         MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
       Socket::Error("Error: Could not configure TLS layer");
     }
-    // set no authentication (DO NOT DO THIS FOR COMPLETE VERSION)
-    mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
-    // Configure random engine & engable debugging
-    mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
 
     //Set up SSL context
     if ((ret = mbedtls_ssl_set_hostname( &ssl, "TLS Server")) != 0) {
@@ -399,8 +414,7 @@ class TCPSocket : public Socket{
     }
     // Configure input/output functions for sending data
     mbedtls_ssl_set_bio(&ssl, &server_fd, mbedtls_net_send, mbedtls_net_recv, NULL);
-
-
+    return true;
   }
   /*!
    * \brief send data using the socket
@@ -442,11 +456,13 @@ class TCPSocket : public Socket{
    * \return size of data actually sent
    */
   inline size_t SendAll(const void *buf_, size_t len) {
+    // TODO: Erroring here
     const unsigned char *buf = reinterpret_cast<const unsigned char*>(buf_);
     size_t ndone = 0;
     while (ndone <  len) {
       ret = mbedtls_ssl_write(&ssl, buf, len);
       if (ret < 0) {
+        print_err(ret);
         if (LastErrorWouldBlock()) return ndone;
         Socket::Error("SendAll");
       }
