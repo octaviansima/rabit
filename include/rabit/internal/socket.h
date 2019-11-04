@@ -64,22 +64,26 @@ const int INVALID_SOCKET = -1;
 #endif  // defined(_WIN32)
 
 #if defined(MBEDTLS_DEBUG_C) && DEBUG_LEVEL > 0
-static void print_err(int ret) {
+/**
+ *
+ * Pretty print error codes thrown by mbedtls
+ */
+static void print_err(int error_code) {
   const size_t LEN = 2048;
   char err_buf[LEN];
-  mbedtls_strerror(ret, err_buf, LEN);
+  mbedtls_strerror(error_code, err_buf, LEN);
   mbedtls_printf(" ERROR: %s\n", err_buf);
 }
 /**
- * Debug callback for mbed TLS
+ * Debug callback for mbedtls
  */
 static void my_debug(void *ctx, int level, const char *file, int line, const char *str) {
   const char *p, *basename;
   (void) ctx;
 
   /* Extract basename from file */
-  for(p = basename = file; *p != '\0'; p++) {
-    if(*p == '/' || *p == '\\') {
+  for (p = basename = file; *p != '\0'; p++) {
+    if (*p == '/' || *p == '\\') {
       basename = p + 1;
     }
   }
@@ -289,7 +293,7 @@ class Socket {
 #ifdef _WIN32
     utils::Error("Socket %s Error:WSAError-code=%d", msg, errsv);
 #else
-    utils::Error("Socket %s Error:%s", msg, strerror(errsv));
+    utils::Error("Socket %s Error:%s\n", msg, strerror(errsv));
 #endif
   }
 
@@ -301,7 +305,7 @@ class Socket {
 /*!
  * \brief a wrapper of TCP socket that hopefully be cross platform
  */
-class TCPSocket : public Socket{
+class TCPSocket : public Socket {
 
   int ret;
 
@@ -430,7 +434,7 @@ class TCPSocket : public Socket{
     while ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
       mbedtls_printf("%d\n", ret);
       if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-        print_err(ret);
+        // print_err(ret);
         Socket::Error("Error: Failed handshake");
       }
     }
@@ -482,12 +486,12 @@ class TCPSocket : public Socket{
     const unsigned char *buf = reinterpret_cast<const unsigned char*>(buf_);
     size_t ndone = 0;
     while (ndone < len) {
-      while ((ret = mbedtls_ssl_write( &ssl, buf, len)) <= 0) {
-        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-          if (LastErrorWouldBlock()) return ndone;
-          print_err(ret);
-          Socket::Error("Error: SendAll");
-        }
+      ret = mbedtls_ssl_write(&ssl, buf, static_cast<size_t>(len - ndone));
+      mbedtls_printf("len: %d\n", len - ndone);
+      if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+        if (LastErrorWouldBlock()) return ndone;
+        print_err(ret);
+        Socket::Error("Error: SendAllNEW");
       }
       buf += ret;
       ndone += ret;
