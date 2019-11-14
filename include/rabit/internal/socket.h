@@ -37,10 +37,12 @@
 #endif
 #include "../../../../mbedtls/include/mbedtls/net.h"
 #include "../../../../mbedtls/include/mbedtls/ssl.h"
+#include "../../../../mbedtls/include/mbedtls/certs.h"
 #include "../../../../mbedtls/include/mbedtls/entropy.h"
 #include "../../../../mbedtls/include/mbedtls/ctr_drbg.h"
 #include "../../../../mbedtls/include/mbedtls/platform.h"
 #include "../../../../mbedtls/include/mbedtls/error.h"
+
 
 #define DEBUG_LEVEL 4
 #if defined(MBEDTLS_DEBUG_C) && DEBUG_LEVEL > 0
@@ -65,16 +67,6 @@ const int INVALID_SOCKET = -1;
 
 #if defined(MBEDTLS_DEBUG_C) && DEBUG_LEVEL > 0
 /**
- *
- * Pretty print error codes thrown by mbedtls
- */
-static void print_err(int error_code) {
-  const size_t LEN = 2048;
-  char err_buf[LEN];
-  mbedtls_strerror(error_code, err_buf, LEN);
-  mbedtls_printf(" ERROR: %s\n", err_buf);
-}
-/**
  * Debug callback for mbedtls
  */
 static void my_debug(void *ctx, int level, const char *file, int line, const char *str) {
@@ -90,6 +82,16 @@ static void my_debug(void *ctx, int level, const char *file, int line, const cha
   mbedtls_printf("%s:%04d: |%d| %s", basename, line, level, str);
 }
 #endif
+/**
+ *
+ * Pretty print error codes thrown by mbedtls
+ */
+static void print_err(int error_code) {
+  const size_t LEN = 2048;
+  char err_buf[LEN];
+  mbedtls_strerror(error_code, err_buf, LEN);
+  mbedtls_printf(" ERROR: %s\n", err_buf);
+}
 
 namespace rabit {
 namespace utils {
@@ -155,6 +157,7 @@ class Socket {
   mbedtls_ssl_config conf;
   mbedtls_x509_crt cacert;
   mbedtls_entropy_context entropy;
+  mbedtls_pk_context pkey;
   // default conversion to mbedtls context
   inline operator mbedtls_net_context() const {
     return server_fd;
@@ -345,8 +348,28 @@ class TCPSocket : public Socket {
     mbedtls_ssl_init(&ssl);
     mbedtls_ssl_config_init(&conf);
     mbedtls_x509_crt_init(&cacert);
+    mbedtls_pk_init(&pkey);
     mbedtls_ctr_drbg_init(&ctr_drbg);
-
+    /*
+     * For testing, currently we use embedded certificate and PK.
+     * Instead, you may want to use mbedtls_x509_crt_parse_file() to read the
+     * server and CA certificates, as well as mbedtls_pk_parse_keyfile().
+     */
+    if ((ret = mbedtls_x509_crt_parse(&cacert, (const unsigned char *) mbedtls_test_srv_crt,
+                                     mbedtls_test_srv_crt_len)) != 0) {
+      print_err(ret);
+      Socket::Error("Error: Certificate could not be parsed (SRV)");
+    }
+    if ((ret = mbedtls_x509_crt_parse(&cacert, (const unsigned char *) mbedtls_test_cas_pem,
+                                     mbedtls_test_cas_pem_len)) != 0) {
+      print_err(ret);
+      Socket::Error("Error: Certificate could not be parsed (PEM)");
+    }
+    if ((ret =  mbedtls_pk_parse_key(&pkey, (const unsigned char *) mbedtls_test_srv_key,
+                                    mbedtls_test_srv_key_len, NULL, 0)) != 0) {
+      print_err(ret);
+      Socket::Error("Error: PK could not be parsed");
+    }
     // seeds and sets up entropy source
     mbedtls_entropy_init(&entropy);
     if ((ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, NULL, 0)) != 0) {
@@ -398,13 +421,13 @@ class TCPSocket : public Socket {
     }
     // configure TLS layer
     if ((ret = mbedtls_ssl_config_defaults(&conf,
-        MBEDTLS_SSL_IS_SERVER, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
+        MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
       print_err(ret);
       Socket::Error("Error: Could not configure TLS layer");
     }
 
     // no certificate auth required (CHANGE FOR COMPLETE VERSION)
-    mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_OPTIONAL);
+    mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
     mbedtls_ssl_conf_ca_chain(&conf, &cacert, NULL);
 
     // configure RNG
@@ -423,7 +446,7 @@ class TCPSocket : public Socket {
     }
 
     // configure hostname
-    if ((ret = mbedtls_ssl_set_hostname(&ssl, "Tracker")) != 0) {
+    if ((ret = mbedtls_ssl_set_hostname(&ssl, addr.AddrStr().c_str())) != 0) {
       print_err(ret);
       Socket::Error("Error: Could not set hostname");
     }
@@ -432,9 +455,8 @@ class TCPSocket : public Socket {
 
     // perform handshake
     while ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
-      mbedtls_printf("%d\n", ret);
       if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-        // print_err(ret);
+        print_err(ret);
         Socket::Error("Error: Failed handshake");
       }
     }
@@ -482,16 +504,14 @@ class TCPSocket : public Socket {
    * \return size of data actually sent
    */
   inline size_t SendAll(const void *buf_, size_t len) {
-    // TODO: Erroring here
     const unsigned char *buf = reinterpret_cast<const unsigned char*>(buf_);
     size_t ndone = 0;
     while (ndone < len) {
       ret = mbedtls_ssl_write(&ssl, buf, static_cast<size_t>(len - ndone));
-      mbedtls_printf("len: %d\n", len - ndone);
-      if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+      if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE && ret < 0) {
         if (LastErrorWouldBlock()) return ndone;
         print_err(ret);
-        Socket::Error("Error: SendAllNEW");
+        Socket::Error("Error: SendAll");
       }
       buf += ret;
       ndone += ret;
@@ -508,14 +528,14 @@ class TCPSocket : public Socket {
   inline size_t RecvAll(void *buf_, size_t len) {
     unsigned char *buf = reinterpret_cast<unsigned char*>(buf_);
     size_t ndone = 0;
-    while (ndone <  len) {
-      ret = mbedtls_ssl_read(&ssl, buf, len);
-      if (ret < 0) {
+    while (ndone < len) {
+      ret = mbedtls_ssl_read(&ssl, buf, static_cast<size_t>(len - ndone));
+      if (ret == 0) return ndone;
+      if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE && ret < 0) {
         if (LastErrorWouldBlock()) return ndone;
         print_err(ret);
         Socket::Error("Error: RecvAll");
       }
-      if (ret == 0) return ndone;
       buf += ret;
       ndone += ret;
     }
