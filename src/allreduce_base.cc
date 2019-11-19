@@ -246,9 +246,9 @@ utils::TCPSocket AllreduceBase::ConnectTracker(void) const {
 
   using utils::Assert;
   Assert(tracker.SendAll(&magic, sizeof(magic)) == sizeof(magic),
-         "ReConnectLink failure 1");
+      "ReConnectLink failure 1");
   Assert(tracker.RecvAll(&magic, sizeof(magic)) == sizeof(magic),
-         "ReConnectLink failure 2");
+      "ReConnectLink failure 2");
   utils::Check(magic == kMagic, "sync::Invalid tracker message, init failure");
   Assert(tracker.SendAll(&rank, sizeof(rank)) == sizeof(rank),
                 "ReConnectLink failure 3");
@@ -303,15 +303,15 @@ bool AllreduceBase::ReConnectLinks(const char *cmd) {
     Assert(tracker.RecvAll(&next_rank, sizeof(next_rank)) == sizeof(next_rank),
            "ReConnectLink failure 4");
 
-    if (sock_listen == INVALID_SOCKET || sock_listen.AtMark()) {
+    if (sock_listen != VALID_SOCKET) {
       if (!sock_listen.IsClosed()) {
         sock_listen.Close();
       }
       // create listening socket
       sock_listen.Create();
-      sock_listen.SetKeepAlive(true);
+      //sock_listen.SetKeepAlive(true);
       // http://deepix.github.io/2016/10/21/tcprst.html
-      sock_listen.SetLinger(0);
+      //sock_listen.SetLinger(0);
       // [slave_port, slave_port+1 .... slave_port + newrank ...slave_port + nport_trial)
       // work around processes bind to same port without set reuse option,
       // start explore from slave_port + newrank towards end

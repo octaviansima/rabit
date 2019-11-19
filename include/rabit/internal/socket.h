@@ -62,6 +62,7 @@ static inline int poll(struct pollfd *pfd, int nfds,
 #include <sys/poll.h>
 typedef int SOCKET;
 typedef size_t sock_size_t;
+const int VALID_SOCKET = 1;
 const int INVALID_SOCKET = -1;
 #endif  // defined(_WIN32)
 
@@ -157,14 +158,14 @@ class Socket {
   mbedtls_ssl_config conf;
   mbedtls_x509_crt cacert;
   mbedtls_entropy_context entropy;
-  mbedtls_pk_context pkey;
+  SOCKET sock;
   // default conversion to mbedtls context
   inline operator mbedtls_net_context() const {
     return server_fd;
   }
   // default conversion to int
   inline operator SOCKET() const {
-    return server_fd.fd;
+    return sock;
   }
   /*!
    * \return last error of socket operation
@@ -271,11 +272,11 @@ class Socket {
   }
   /*! \brief check if socket is already closed */
   inline bool IsClosed(void) const {
-    return server_fd.fd == INVALID_SOCKET;
+    return sock == INVALID_SOCKET;
   }
   /*! \brief close the socket */
   inline void Close(void) {
-    if (server_fd.fd != INVALID_SOCKET) {
+    if (sock == VALID_SOCKET) {
 #ifdef _WIN32
       closesocket(server_fd);
 #else
@@ -285,7 +286,7 @@ class Socket {
       mbedtls_ctr_drbg_free(&ctr_drbg);
       mbedtls_entropy_free(&entropy);
 #endif
-      server_fd.fd = INVALID_SOCKET;
+      sock = INVALID_SOCKET;
     } else {
       Error("Socket::Close double close the socket or close without create");
     }
@@ -300,8 +301,8 @@ class Socket {
 #endif
   }
 
- protected:
-  explicit Socket(SOCKET sockfd) {
+protected:
+  explicit Socket(SOCKET sock) : sock(sock) {
   }
 };
 
@@ -313,11 +314,9 @@ class TCPSocket : public Socket {
   int ret;
 
  public:
-  // constructor (initializes server_fd to be -1 (INVALID_SOCKET)
   TCPSocket(void) : Socket(INVALID_SOCKET) {
   }
-  // initializes server_fd to be whatever is passed in (not invalid)
-  explicit TCPSocket(SOCKET sockfd) : Socket(sockfd) {
+  explicit TCPSocket(SOCKET sock) : Socket(sock) {
   }
   /*!
    * \brief enable/disable TCP keepalive
@@ -348,28 +347,9 @@ class TCPSocket : public Socket {
     mbedtls_ssl_init(&ssl);
     mbedtls_ssl_config_init(&conf);
     mbedtls_x509_crt_init(&cacert);
-    mbedtls_pk_init(&pkey);
     mbedtls_ctr_drbg_init(&ctr_drbg);
-    /*
-     * For testing, currently we use embedded certificate and PK.
-     * Instead, you may want to use mbedtls_x509_crt_parse_file() to read the
-     * server and CA certificates, as well as mbedtls_pk_parse_keyfile().
-     */
-    if ((ret = mbedtls_x509_crt_parse(&cacert, (const unsigned char *) mbedtls_test_srv_crt,
-                                     mbedtls_test_srv_crt_len)) != 0) {
-      print_err(ret);
-      Socket::Error("Error: Certificate could not be parsed (SRV)");
-    }
-    if ((ret = mbedtls_x509_crt_parse(&cacert, (const unsigned char *) mbedtls_test_cas_pem,
-                                     mbedtls_test_cas_pem_len)) != 0) {
-      print_err(ret);
-      Socket::Error("Error: Certificate could not be parsed (PEM)");
-    }
-    if ((ret =  mbedtls_pk_parse_key(&pkey, (const unsigned char *) mbedtls_test_srv_key,
-                                    mbedtls_test_srv_key_len, NULL, 0)) != 0) {
-      print_err(ret);
-      Socket::Error("Error: PK could not be parsed");
-    }
+    sock = VALID_SOCKET;
+
     // seeds and sets up entropy source
     mbedtls_entropy_init(&entropy);
     if ((ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, NULL, 0)) != 0) {
@@ -405,6 +385,7 @@ class TCPSocket : public Socket {
     int atmark;
     if (ioctl(server_fd.fd, SIOCATMARK, &atmark) == -1) return -1;
 #endif  // _WIN32
+    mbedtls_printf("%d\n\n\n\n", atmark);
     return static_cast<int>(atmark);
   }
   /*!
