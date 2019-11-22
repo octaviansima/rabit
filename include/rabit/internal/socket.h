@@ -44,7 +44,7 @@
 #include "../../../../mbedtls/include/mbedtls/error.h"
 
 
-#define DEBUG_LEVEL 4
+#define DEBUG_LEVEL 0
 #if defined(MBEDTLS_DEBUG_C) && DEBUG_LEVEL > 0
 #include "../../../../mbedtls/include/mbedtls/debug.h"
 #endif
@@ -62,7 +62,6 @@ static inline int poll(struct pollfd *pfd, int nfds,
 #include <sys/poll.h>
 typedef int SOCKET;
 typedef size_t sock_size_t;
-const int VALID_SOCKET = 1;
 const int INVALID_SOCKET = -1;
 #endif  // defined(_WIN32)
 
@@ -158,14 +157,14 @@ class Socket {
   mbedtls_ssl_config conf;
   mbedtls_x509_crt cacert;
   mbedtls_entropy_context entropy;
-  SOCKET sock;
+  bool created;
   // default conversion to mbedtls context
   inline operator mbedtls_net_context() const {
     return server_fd;
   }
   // default conversion to int
   inline operator SOCKET() const {
-    return sock;
+    return server_fd.fd;
   }
   /*!
    * \return last error of socket operation
@@ -258,7 +257,7 @@ class Socket {
   inline int GetSockError(void) const {
     int error = 0;
     socklen_t len = sizeof(error);
-    if (getsockopt(server_fd.fd,  SOL_SOCKET, SO_ERROR,
+    if (server_fd.fd != INVALID_SOCKET && getsockopt(server_fd.fd,  SOL_SOCKET, SO_ERROR,
             reinterpret_cast<char*>(&error), &len) != 0) {
       Error("GetSockError");
     }
@@ -272,11 +271,11 @@ class Socket {
   }
   /*! \brief check if socket is already closed */
   inline bool IsClosed(void) const {
-    return sock == INVALID_SOCKET;
+    return !created;
   }
   /*! \brief close the socket */
   inline void Close(void) {
-    if (sock == VALID_SOCKET) {
+    if (created) {
 #ifdef _WIN32
       closesocket(server_fd);
 #else
@@ -286,7 +285,8 @@ class Socket {
       mbedtls_ctr_drbg_free(&ctr_drbg);
       mbedtls_entropy_free(&entropy);
 #endif
-      sock = INVALID_SOCKET;
+      server_fd.fd = INVALID_SOCKET;
+      created = false;
     } else {
       Error("Socket::Close double close the socket or close without create");
     }
@@ -300,10 +300,6 @@ class Socket {
     utils::Error("Socket %s Error:%s\n", msg, strerror(errsv));
 #endif
   }
-
-protected:
-  explicit Socket(SOCKET sock) : sock(sock) {
-  }
 };
 
 /*!
@@ -314,9 +310,14 @@ class TCPSocket : public Socket {
   int ret;
 
  public:
-  TCPSocket(void) : Socket(INVALID_SOCKET) {
+  TCPSocket(void) {
+    created = false;
+    this->Create();
   }
-  explicit TCPSocket(SOCKET sock) : Socket(sock) {
+  explicit TCPSocket(SOCKET sockfd) {
+    created = false;
+    this->Create();
+    server_fd.fd = sockfd;
   }
   /*!
    * \brief enable/disable TCP keepalive
@@ -324,7 +325,7 @@ class TCPSocket : public Socket {
    */
   void SetKeepAlive(bool keepalive) {
     int opt = static_cast<int>(keepalive);
-    if (setsockopt(server_fd.fd, SOL_SOCKET, SO_KEEPALIVE,
+    if (server_fd.fd != INVALID_SOCKET && setsockopt(server_fd.fd, SOL_SOCKET, SO_KEEPALIVE,
                    reinterpret_cast<char*>(&opt), sizeof(opt)) < 0) {
       Socket::Error("SetKeepAlive");
     }
@@ -333,7 +334,8 @@ class TCPSocket : public Socket {
     struct linger sl;
     sl.l_onoff = 1;    /* non-zero value enables linger option in kernel */
     sl.l_linger = timeout;    /* timeout interval in seconds */
-    if (setsockopt(server_fd.fd, SOL_SOCKET, SO_LINGER, reinterpret_cast<char*>(&sl), sizeof(sl)) == -1) {
+    if (server_fd.fd != INVALID_SOCKET &&
+                    setsockopt(server_fd.fd, SOL_SOCKET, SO_LINGER, reinterpret_cast<char*>(&sl), sizeof(sl)) == -1) {
       Socket::Error("SO_LINGER");
     }
   }
@@ -348,8 +350,7 @@ class TCPSocket : public Socket {
     mbedtls_ssl_config_init(&conf);
     mbedtls_x509_crt_init(&cacert);
     mbedtls_ctr_drbg_init(&ctr_drbg);
-    sock = VALID_SOCKET;
-
+    created = true;
     // seeds and sets up entropy source
     mbedtls_entropy_init(&entropy);
     if ((ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, NULL, 0)) != 0) {
@@ -362,7 +363,6 @@ class TCPSocket : public Socket {
    * \param backlog backlog parameter
    */
   inline void Listen(int backlog = 16) {
-    //TODO: start off here if needed?
     listen(server_fd.fd, backlog);
   }
   /*! \brief get a new connection */
@@ -383,10 +383,9 @@ class TCPSocket : public Socket {
     if (ioctlsocket(server_fd, SIOCATMARK, &atmark) != NO_ERROR) return -1;
 #else
     int atmark;
-    if (ioctl(server_fd.fd, SIOCATMARK, &atmark) == -1) return -1;
+    if (server_fd.fd != INVALID_SOCKET && ioctl(server_fd.fd, SIOCATMARK, &atmark) == -1) return -1;
 #endif  // _WIN32
-    mbedtls_printf("%d\n\n\n\n", atmark);
-    return static_cast<int>(atmark);
+    return atmark;
   }
   /*!
    * \brief connect to an address
@@ -510,13 +509,16 @@ class TCPSocket : public Socket {
     unsigned char *buf = reinterpret_cast<unsigned char*>(buf_);
     size_t ndone = 0;
     while (ndone < len) {
+      mbedtls_printf("pid: %d ndone: %d len: %d. before ssl_read\n", getpid(), ndone, len);
       ret = mbedtls_ssl_read(&ssl, buf, static_cast<size_t>(len - ndone));
-      if (ret == 0) return ndone;
+      mbedtls_printf("pid: %d ndone: %d len: %d ret: %d. after ssl_read\n", getpid(), ndone, len, ret);
       if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE && ret < 0) {
+        print_err(ret);
         if (LastErrorWouldBlock()) return ndone;
         print_err(ret);
         Socket::Error("Error: RecvAll");
       }
+      if (ret == 0) return ndone;
       buf += ret;
       ndone += ret;
     }

@@ -277,12 +277,15 @@ bool AllreduceBase::ReConnectLinks(const char *cmd) {
     using utils::Assert;
     // get new ranks
     int newrank, num_neighbors;
+    // TODO: gets stuck at line below
+    mbedtls_printf("pid: %d, BEFORE reconnect failure 4.1\n", getpid());
     Assert(tracker.RecvAll(&newrank, sizeof(newrank)) == sizeof(newrank),
-           "ReConnectLink failure 4");
+           "ReConnectLink failure 4.1");
+    mbedtls_printf("pid: %d, AFTER reconnect failure 4.1\n", getpid());
     Assert(tracker.RecvAll(&parent_rank, sizeof(parent_rank)) == \
-         sizeof(parent_rank), "ReConnectLink failure 4");
+         sizeof(parent_rank), "ReConnectLink failure 4.2");
     Assert(tracker.RecvAll(&world_size, sizeof(world_size)) == sizeof(world_size),
-           "ReConnectLink failure 4");
+           "ReConnectLink failure 4.3");
     Assert(rank == -1 || newrank == rank,
            "must keep rank to same if the node already have one");
     rank = newrank;
@@ -291,27 +294,26 @@ bool AllreduceBase::ReConnectLinks(const char *cmd) {
     if (rank == -1) exit(-1);
 
     Assert(tracker.RecvAll(&num_neighbors, sizeof(num_neighbors)) == \
-         sizeof(num_neighbors), "ReConnectLink failure 4");
+         sizeof(num_neighbors), "ReConnectLink failure 4.4");
     for (int i = 0; i < num_neighbors; ++i) {
       int nrank;
       Assert(tracker.RecvAll(&nrank, sizeof(nrank)) == sizeof(nrank),
-             "ReConnectLink failure 4");
+             "ReConnectLink failure 4.5");
       tree_neighbors[nrank] = 1;
     }
     Assert(tracker.RecvAll(&prev_rank, sizeof(prev_rank)) == sizeof(prev_rank),
-           "ReConnectLink failure 4");
+           "ReConnectLink failure 4.6");
     Assert(tracker.RecvAll(&next_rank, sizeof(next_rank)) == sizeof(next_rank),
-           "ReConnectLink failure 4");
-
-    if (sock_listen != VALID_SOCKET) {
+           "ReConnectLink failure 4.7");
+    if (sock_listen == INVALID_SOCKET || sock_listen.AtMark()) {
       if (!sock_listen.IsClosed()) {
         sock_listen.Close();
       }
       // create listening socket
       sock_listen.Create();
-      //sock_listen.SetKeepAlive(true);
+      sock_listen.SetKeepAlive(true);
       // http://deepix.github.io/2016/10/21/tcprst.html
-      //sock_listen.SetLinger(0);
+      sock_listen.SetLinger(0);
       // [slave_port, slave_port+1 .... slave_port + newrank ...slave_port + nport_trial)
       // work around processes bind to same port without set reuse option,
       // start explore from slave_port + newrank towards end
